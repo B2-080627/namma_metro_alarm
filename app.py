@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import streamlit.components.v1 as components
-from math import radians, sin, cos, sqrt, atan2
+import base64
 
 st.set_page_config(page_title="Namma Metro GPS Alarm", page_icon="🚇", layout="wide")
 
@@ -17,11 +17,34 @@ df = load_data()
 
 alarm_distance = st.sidebar.slider("Alarm Distance (meters)", 100, 2000, 500, 100)
 st.sidebar.markdown("---")
+
+# Custom alarm sound uploader
+st.sidebar.markdown("### 🔔 Custom Alarm Sound")
+uploaded_alarm = st.sidebar.file_uploader(
+    "Upload your alarm sound (MP3/OGG/WAV)",
+    type=["mp3", "ogg", "wav"],
+    help="Leave empty to use the default alarm"
+)
+
+custom_alarm_b64 = ""
+custom_alarm_mime = ""
+if uploaded_alarm is not None:
+    audio_bytes = uploaded_alarm.read()
+    custom_alarm_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    ext = uploaded_alarm.name.rsplit(".", 1)[-1].lower()
+    custom_alarm_mime = {"mp3": "audio/mpeg", "ogg": "audio/ogg", "wav": "audio/wav"}.get(ext, "audio/mpeg")
+    st.sidebar.success(f"✅ Using: {uploaded_alarm.name}")
+
+st.sidebar.markdown("---")
 st.sidebar.caption("💡 Search and select your destination station directly on the map panel.")
 
 stations_json = df[["Name","latitude","longitude"]].rename(
     columns={"Name":"name","latitude":"lat","longitude":"lon"}
 ).to_json(orient="records")
+
+# Build adjacency list for metro lines (sequential stations = neighbours)
+# We pass the full ordered list; JS will compute path distance via BFS
+stations_ordered_json = df[["Name"]].rename(columns={"Name":"name"}).to_json(orient="records")
 
 html = f"""
 <!DOCTYPE html>
@@ -31,6 +54,8 @@ html = f"""
 <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<!-- NoSleep.js prevents screen / tab from sleeping -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/nosleep/0.12.0/NoSleep.min.js"></script>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box;}}
 body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8f0;
@@ -95,6 +120,13 @@ body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8
 }}
 .statusbar.ok{{color:#4ade80;}} .statusbar.warn{{color:#fbbf24;}} .statusbar.err{{color:#f87171;}}
 
+/* ── KEEPALIVE badge ── */
+.ka-badge{{
+  margin-left:auto;font-size:.6rem;padding:2px 7px;border-radius:10px;
+  background:#1e293b;color:#475569;border:1px solid #2d3147;white-space:nowrap;
+}}
+.ka-badge.ok{{color:#4ade80;border-color:#166534;}}
+
 /* ── ALARM BANNER ── */
 .alarm{{display:none;padding:10px 14px;font-size:.88rem;font-weight:700;text-align:center;flex-shrink:0;}}
 .alarm.approaching{{display:block;background:#78350f;color:#fde68a;}}
@@ -140,13 +172,14 @@ body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8
   <div class="stats">
     <div class="stat"><span class="slabel">Nearest Station</span><span class="sval green" id="sNearest">—</span></div>
     <div class="stat"><span class="slabel">Destination</span><span class="sval red" id="sDest">Not set</span></div>
-    <div class="stat"><span class="slabel">Distance Left</span><span class="sval yellow" id="sDist">—</span></div>
+    <div class="stat"><span class="slabel">Route Distance</span><span class="sval yellow" id="sDist">—</span></div>
     <div class="stat"><span class="slabel">Accuracy</span><span class="sval" id="sAcc">—</span></div>
   </div>
 
-  <div style="display:flex;gap:7px;">
+  <div style="display:flex;gap:7px;align-items:center;">
     <button class="btn btn-go" id="btnTrack" onclick="toggleTracking()">▶ Start</button>
     <button class="btn btn-sm" onclick="centerMap()">⊙</button>
+    <span class="ka-badge" id="kaBadge">⏳ standby</span>
   </div>
 </div>
 
@@ -166,16 +199,75 @@ body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f1117;color:#e2e8
   <div class="infobar-stat"><span class="infobar-label">Lat</span><span class="infobar-val" id="iLat">—</span></div>
   <div class="infobar-stat"><span class="infobar-label">Lon</span><span class="infobar-val" id="iLon">—</span></div>
   <div class="infobar-stat"><span class="infobar-label">Updates</span><span class="infobar-val" id="iCount">0</span></div>
+  <div class="infobar-stat"><span class="infobar-label">Kept alive</span><span class="infobar-val" id="iKa">0 min</span></div>
 </div>
 
+<!-- AUDIO: default fallback; JS replaces src if custom sound uploaded -->
 <audio id="alarmAudio" loop>
-  <source src="https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg" type="audio/ogg"/>
+  <source id="alarmSrc" src="https://actions.google.com/sounds/v1/alarms/alarm_clock.ogg" type="audio/ogg"/>
 </audio>
 
 <script>
 // ── DATA ──
 const STATIONS   = {stations_json};
 const ALARM_DIST = {alarm_distance};
+
+// ── CUSTOM ALARM SOUND (injected by Python if uploaded) ──
+const CUSTOM_ALARM_B64  = "{custom_alarm_b64}";
+const CUSTOM_ALARM_MIME = "{custom_alarm_mime}";
+
+if (CUSTOM_ALARM_B64) {{
+  const audio = document.getElementById('alarmAudio');
+  audio.src = 'data:' + CUSTOM_ALARM_MIME + ';base64,' + CUSTOM_ALARM_B64;
+  audio.load();
+}}
+
+// ── BUILD METRO GRAPH FOR ROUTE-DISTANCE ──
+// Treat consecutive rows as connected neighbours (same line).
+// Each station object gets an index for BFS.
+const stationIndex = {{}};
+STATIONS.forEach((s,i) => stationIndex[s.name] = i);
+
+// Adjacency list: index -> [neighbour index, distance in metres]
+const graph = Array.from({{length: STATIONS.length}}, () => []);
+
+function haversineM(lat1,lon1,lat2,lon2) {{
+  const R=6371000, dLat=(lat2-lat1)*Math.PI/180, dLon=(lon2-lon1)*Math.PI/180;
+  const a=Math.sin(dLat/2)**2+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}}
+
+// Connect each station to the next (sequential in CSV = same line)
+// Stations from different lines will have a large gap; skip if > 3 km
+const MAX_ADJACENT_DIST = 3000; // metres
+for (let i = 0; i < STATIONS.length - 1; i++) {{
+  const a = STATIONS[i], b = STATIONS[i+1];
+  const d = haversineM(a.lat, a.lon, b.lat, b.lon);
+  if (d < MAX_ADJACENT_DIST) {{
+    graph[i].push([i+1, d]);
+    graph[i+1].push([i, d]);
+  }}
+}}
+
+// Dijkstra: returns shortest metro-path distance between two station indices
+function routeDistance(startIdx, endIdx) {{
+  if (startIdx === endIdx) return 0;
+  const dist = new Float64Array(STATIONS.length).fill(Infinity);
+  dist[startIdx] = 0;
+  // Simple priority queue via sorted array (small graph, fine for N<200)
+  const pq = [[0, startIdx]];
+  while (pq.length) {{
+    pq.sort((a,b) => a[0]-b[0]);
+    const [d, u] = pq.shift();
+    if (d > dist[u]) continue;
+    if (u === endIdx) return dist[endIdx];
+    for (const [v, w] of graph[u]) {{
+      const nd = d + w;
+      if (nd < dist[v]) {{ dist[v] = nd; pq.push([nd, v]); }}
+    }}
+  }}
+  return dist[endIdx]; // Infinity if not connected
+}}
 
 // ── MAP ──
 const map = L.map('map',{{zoomControl:true}}).setView([12.9716,77.5946],13);
@@ -186,7 +278,17 @@ const satLayer = L.tileLayer(
   {{attribution:'Esri',maxZoom:19}});
 L.control.layers({{'Street':streetLayer}},{{'Satellite':satLayer}}).addTo(map);
 
-// All station dots
+// Draw metro line segments and station dots
+for (let i = 0; i < STATIONS.length - 1; i++) {{
+  const a = STATIONS[i], b = STATIONS[i+1];
+  const d = haversineM(a.lat, a.lon, b.lat, b.lon);
+  if (d < MAX_ADJACENT_DIST) {{
+    L.polyline([[a.lat,a.lon],[b.lat,b.lon]], {{
+      color:'#60a5fa', weight:2.5, opacity:0.5
+    }}).addTo(map);
+  }}
+}}
+
 STATIONS.forEach(s=>{{
   L.circleMarker([s.lat,s.lon],{{
     radius:5,color:'#60a5fa',fillColor:'#3b82f6',fillOpacity:.8,weight:1.5
@@ -194,7 +296,7 @@ STATIONS.forEach(s=>{{
 }});
 
 // ── DESTINATION STATE ──
-let destLat=null, destLon=null, destName=null;
+let destLat=null, destLon=null, destName=null, destIdx=null;
 let destMarker=null, alarmRing=null, routeLine=null;
 
 const destIcon = L.divIcon({{
@@ -209,6 +311,7 @@ function setDestination(station) {{
   destLat  = station.lat;
   destLon  = station.lon;
   destName = station.name;
+  destIdx  = stationIndex[station.name] ?? null;
 
   if (destMarker) map.removeLayer(destMarker);
   if (alarmRing)  map.removeLayer(alarmRing);
@@ -292,7 +395,6 @@ function onKey(e) {{
   }}
 }}
 
-// Close dropdown on outside click
 document.addEventListener('mousedown', e=>{{
   if (!document.getElementById('searchWrap').contains(e.target)) closeDropdown();
 }});
@@ -314,16 +416,39 @@ function setStatus(msg,cls='') {{
   el.textContent=msg; el.className='statusbar '+cls;
 }}
 
-function haversineM(lat1,lon1,lat2,lon2) {{
-  const R=6371000,dLat=(lat2-lat1)*Math.PI/180,dLon=(lon2-lon1)*Math.PI/180;
-  const a=Math.sin(dLat/2)**2+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
-  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
-}}
-
 function nearestStation(lat,lon) {{
   let best=null,bestD=Infinity;
   STATIONS.forEach(s=>{{ const d=haversineM(lat,lon,s.lat,s.lon); if(d<bestD){{bestD=d;best=s;}} }});
   return best;
+}}
+
+// ── KEEP-ALIVE & NO-SLEEP ──
+const noSleep = new NoSleep();
+let kaMinutes = 0;
+let kaInterval = null;
+
+function startKeepAlive() {{
+  noSleep.enable();
+  kaMinutes = 0;
+  // Ping a tiny data URL every 30 s to prevent browser throttling
+  kaInterval = setInterval(() => {{
+    kaMinutes += 0.5;
+    document.getElementById('iKa').textContent = kaMinutes.toFixed(0) + ' min';
+    const badge = document.getElementById('kaBadge');
+    badge.textContent = '🟢 alive ' + kaMinutes.toFixed(0) + 'm';
+    badge.className = 'ka-badge ok';
+    // Tiny no-op fetch to keep service worker / network alive
+    fetch('data:text/plain,ping').catch(()=>{{}});
+  }}, 30000);
+}}
+
+function stopKeepAlive() {{
+  noSleep.disable();
+  clearInterval(kaInterval);
+  kaInterval = null;
+  const badge = document.getElementById('kaBadge');
+  badge.textContent = '⏹ stopped';
+  badge.className = 'ka-badge';
 }}
 
 function toggleTracking() {{
@@ -338,6 +463,7 @@ function startTracking() {{
   document.getElementById('btnTrack').textContent='⏹ Stop';
   document.getElementById('btnTrack').className='btn btn-stop';
   document.getElementById('pulse').classList.add('on');
+  startKeepAlive();
   watchId=navigator.geolocation.watchPosition(onPosition,onError,{{
     enableHighAccuracy:true,timeout:15000,maximumAge:0
   }});
@@ -351,11 +477,12 @@ function stopTracking() {{
   document.getElementById('pulse').classList.remove('on');
   document.getElementById('alarmBanner').className='alarm';
   document.getElementById('alarmAudio').pause();
+  stopKeepAlive();
   setStatus('Tracking stopped. '+updateCount+' update(s) recorded.');
 }}
 
 function onPosition(pos) {{
-  const lat=pos.coords.latitude,lon=pos.coords.longitude,acc=pos.coords.accuracy;
+  const lat=pos.coords.latitude, lon=pos.coords.longitude, acc=pos.coords.accuracy;
   const now=new Date();
   updateCount++;
 
@@ -371,32 +498,55 @@ function onPosition(pos) {{
   if (trackPoints.length>1)
     trackPolyline=L.polyline(trackPoints,{{color:'#4ade80',weight:3,opacity:.6,dashArray:'5 4'}}).addTo(map);
 
+  // ── ROUTE DISTANCE (via metro stations, not straight line) ──
+  let distM = null;
+  let distTxt = '—';
+  let distLabel = 'Route Distance';
+
+  if (destIdx !== null) {{
+    // Find nearest station to user
+    const ns = nearestStation(lat, lon);
+    const nsIdx = stationIndex[ns.name];
+    const routeM = routeDistance(nsIdx, destIdx);
+
+    if (isFinite(routeM)) {{
+      // Add walking distance from user to nearest station
+      const walkM = haversineM(lat, lon, ns.lat, ns.lon);
+      distM = walkM + routeM;
+      distTxt = distM >= 1000 ? (distM/1000).toFixed(2)+' km' : Math.round(distM)+' m';
+      distLabel = 'Route (' + ns.name.split(' ')[0] + '→' + destName.split(' ')[0] + ')';
+    }} else {{
+      // Fallback to straight-line if not on same connected line
+      distM = haversineM(lat, lon, destLat, destLon);
+      distTxt = (distM >= 1000 ? (distM/1000).toFixed(2)+' km' : Math.round(distM)+' m') + ' ✳';
+      distLabel = 'Straight-line ⚠';
+    }}
+  }}
+
   if (routeLine) map.removeLayer(routeLine);
   if (destLat) routeLine=L.polyline([[lat,lon],[destLat,destLon]],{{
     color:'#f87171',weight:2,opacity:.5,dashArray:'8 5'
   }}).addTo(map);
 
-  const ns=nearestStation(lat,lon);
-  const distM=destLat ? haversineM(lat,lon,destLat,destLon) : null;
-  const distTxt=distM!==null ? (distM>=1000?(distM/1000).toFixed(2)+' km':Math.round(distM)+' m') : '—';
-
-  document.getElementById('sNearest').textContent=ns?ns.name:'—';
-  document.getElementById('sDist').textContent=distTxt;
-  document.getElementById('sAcc').textContent='±'+Math.round(acc)+'m';
-  document.getElementById('iLat').textContent=lat.toFixed(6);
-  document.getElementById('iLon').textContent=lon.toFixed(6);
-  document.getElementById('iCount').textContent=updateCount;
+  const ns = nearestStation(lat,lon);
+  document.getElementById('sNearest').textContent = ns ? ns.name : '—';
+  document.getElementById('sDist').textContent     = distTxt;
+  document.getElementById('sAcc').textContent      = '±'+Math.round(acc)+'m';
+  document.getElementById('iLat').textContent      = lat.toFixed(6);
+  document.getElementById('iLon').textContent      = lon.toFixed(6);
+  document.getElementById('iCount').textContent    = updateCount;
   setStatus('Updated '+now.toLocaleTimeString()+' · ±'+Math.round(acc)+'m accuracy','ok');
 
-  // Alarm
+  // ── ALARM (uses straight-line to destination for proximity trigger) ──
+  const straightM = destLat ? haversineM(lat,lon,destLat,destLon) : null;
   const banner=document.getElementById('alarmBanner');
   const audio=document.getElementById('alarmAudio');
-  if (distM!==null) {{
-    if (distM<=ALARM_DIST) {{
+  if (straightM !== null) {{
+    if (straightM <= ALARM_DIST) {{
       banner.className='alarm arriving';
-      banner.textContent='🔔 ARRIVING AT '+destName+' — '+Math.round(distM)+'m away!';
+      banner.textContent='🔔 ARRIVING AT '+destName+' — '+Math.round(straightM)+'m away!';
       if (!alarmFired) {{ audio.play().catch(()=>{{}}); alarmFired=true; }}
-    }} else if (distM<=ALARM_DIST*2) {{
+    }} else if (straightM <= ALARM_DIST*2) {{
       banner.className='alarm approaching';
       banner.textContent='⚠ Approaching '+destName+' — '+distTxt+' remaining';
       audio.pause(); alarmFired=false;
